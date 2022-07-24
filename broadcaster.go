@@ -22,7 +22,7 @@ type BroadcastListener[T any] struct {
 	bc *Broadcaster[T]
 	msg chan T
 	resp chan struct{}
-	state int // 0 = wating for message | 1 = message received, must report
+	state int // 0 = waiting for message | 1 = message received, must report
 }
 
 // Creates a new Broadcaster
@@ -88,6 +88,11 @@ func (l *BroadcastListener[T]) Listen() T {
 	if l.state != 0 {
 		panic(fmt.Errorf("listen: previous message not handled correcly, probably missing report"))
 	}
+
+	defer func() {
+		l.state = 1
+	}()
+
 	return <- l.msg
 }
 
@@ -96,7 +101,9 @@ func (l *BroadcastListener[T]) Report() {
 	if l.state != 1 {
 		panic(fmt.Errorf("report: no message waiting to be reported"))
 	}
+
 	l.resp <- struct{}{}
+	l.state = 0
 }
 
 // Waits for the message and tells the Broadcaster to continue instantly
@@ -105,10 +112,11 @@ func (l *BroadcastListener[T]) Get() T {
 		panic(fmt.Errorf("listen: previous message not handled correcly, probably missing report"))
 	}
 
-	res := <- l.msg
-	l.resp <- struct{}{}
+	defer func() {
+		l.resp <- struct{}{}
+	}()
 
-	return res
+	return <- l.msg
 }
 
 // Removes the listener from the Broadcaster, making it unusable

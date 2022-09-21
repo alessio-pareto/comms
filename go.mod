@@ -1,3 +1,3 @@
-module github.com/alessio-pareto/comms
+module github.com/nixpare/comms
 
 go 1.18

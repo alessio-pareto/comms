@@ -1,131 +1,158 @@
 package comms
 
 import (
-	"fmt"
 	"sync"
 )
 
-// Broadcaster provides an easy way to spread a message to
-// to an unlimited number of listeners, with concurrency in mind.
-// The message is not only ment as a string, but can be whatever
-// type of data you want
+// Broadcaster is the message generator and where everything is managed.
+// The message can be whatever type of data you want thanks to
+// the generics
 type Broadcaster[T any] struct {
-	incr int
-	listeners map[int]*BroadcastListener[T]
-	mutex sync.Mutex
+	incr      int
+	listeners map[int]*broadcastListener[T]
+	mutex     sync.Mutex
+	wg        *sync.WaitGroup
 }
 
-// BroadcastListener is the product of the registration to a
+// broadcastListener is the product of the registration to a
 // Broadcaster and listens for the incoming messages
-type BroadcastListener[T any] struct {
-	id int
-	bc *Broadcaster[T]
-	msg chan T
-	resp chan struct{}
-	state int // 0 = waiting for message | 1 = message received, must report
+type broadcastListener[T any] struct {
+	id          int
+	msgChan     chan *BroadcastMessage[T]
+	hasReported bool
 }
 
-// Creates a new Broadcaster
+// BroadcastMessage rapresents the broadcasted message encapsulated
+// in a structure. This is provided by the Broadcaster when listening
+// for a message and forcing the Broadcaster to wait for the usage report
+type BroadcastMessage[T any] struct {
+	msg         T
+	l 			*broadcastListener[T]
+	listeners   map[int]*broadcastListener[T]
+	wg          *sync.WaitGroup
+}
+
+// NewBroadcaster creates a new Broadcaster
 func NewBroadcaster[T any]() *Broadcaster[T] {
-	bc := new(Broadcaster[T])
-	bc.listeners = make(map[int]*BroadcastListener[T])
-
-	return bc
+	return new(Broadcaster[T])
 }
 
-func (bc *Broadcaster[T]) send(msg T) {
+func (bc *Broadcaster[T]) reset() {
+	bc.incr = 0
+	bc.wg = new(sync.WaitGroup)
+	bc.listeners = make(map[int]*broadcastListener[T])
+}
+
+func (bc *Broadcaster[T]) send(msg T) *BroadcastMessage[T] {
 	bc.mutex.Lock()
 	defer bc.mutex.Unlock()
 
-	wg := new(sync.WaitGroup)
-	for _, l := range bc.listeners {
-		wg.Add(1)
-
-		go func(l *BroadcastListener[T]) {
-			l.msg <- msg
-			<- l.resp
-
-			wg.Done()
-		}(l)
+	if bc.listeners == nil {
+		return nil
 	}
-	
-	wg.Wait()
+
+	defer bc.reset()
+
+	bcm := &BroadcastMessage[T] {
+		msg: msg,
+		listeners: make(map[int]*broadcastListener[T]),
+		wg: bc.wg,
+	}
+
+	for key, value := range bc.listeners {
+		bcm.listeners[key] = value
+	}
+
+	for _, l := range bcm.listeners {
+		l.msgChan <- bcm
+	}
+
+	return bcm
 }
 
-// Sends a message to the current registered listeners. The process is done
-// in a different GoRouting, but each process waits first the spread of the
-// previous message
+// Send sends a message to the current registered listeners
 func (bc *Broadcaster[T]) Send(msg T) {
-	go bc.send(msg)
-}
-
-// Sends a message and waits all the listeners to report their usage
-func (bc *Broadcaster[T]) SendAndWait(msg T) {
 	bc.send(msg)
 }
 
-// Creates a new Listener
-func (bc *Broadcaster[T]) Subscribe() *BroadcastListener[T] {
+// SendAndWait sends a message and waits all the listeners to report their usage
+func (bc *Broadcaster[T]) SendAndWait(msg T) {
+	bcm := bc.send(msg)
+	if bcm == nil {
+		return
+	}
+
+	bcm.wg.Wait()
+}
+
+// subscribe creates a new broadcastListener and registers it
+// to the broadcaster
+func (bc *Broadcaster[T]) subscribe() *broadcastListener[T] {
 	bc.mutex.Lock()
 	defer bc.mutex.Unlock()
 
-	l := &BroadcastListener[T] {
+	if bc.listeners == nil {
+		bc.reset()
+	}
+	bc.wg.Add(1)
+
+	l := &broadcastListener[T] {
 		id: bc.incr,
-		bc: bc,
-		msg: make(chan T, 10),
-		resp: make(chan struct{}, 10),
+		msgChan: make(chan *BroadcastMessage[T]),
 	}
 
 	bc.listeners[bc.incr] = l
 	bc.incr ++
-	
+
 	return l
 }
 
-// Waits for the next message. The listener should the notify the
-// Broadcaster when it has finished using the message
-func (l *BroadcastListener[T]) Listen() T {
-	if l.state != 0 {
-		panic(fmt.Errorf("listen: previous message not handled correcly, probably missing report"))
+// unsubscribe removes the listener from the Broadcaster, making it unusable
+func (l *broadcastListener[T]) unsubscribe(msg BroadcastMessage[T]) {
+	close(l.msgChan)
+	delete(msg.listeners, l.id)
+}
+
+// get waits for the message from the Broadcaster
+func (l *broadcastListener[T]) get() BroadcastMessage[T] {
+	bcm := <- l.msgChan
+
+	return BroadcastMessage[T] {
+		msg: bcm.msg,
+		l: l,
+		listeners: bcm.listeners,
+		wg: bcm.wg,
 	}
+}
 
-	defer func() {
-		l.state = 1
-	}()
+// Get waits for the message and tells the Broadcaster to continue instantly
+func (bc *Broadcaster[T]) Get() T {
+	l := bc.subscribe()
 
-	return <- l.msg
+	bcm := l.get()
+	defer bcm.Report()
+
+	return bcm.msg
+}
+
+// Listen waits for the next message. The listener should later notify the
+// Broadcaster when it has finished using the message
+func (bc *Broadcaster[T]) Listen() BroadcastMessage[T] {
+	return bc.subscribe().get()
+}
+
+// Message returns the broadcast message received
+func (bcm *BroadcastMessage[T]) Message() T {
+	return bcm.msg
 }
 
 // Communicates to the Broadcaster that the message has been used
-func (l *BroadcastListener[T]) Report() {
-	if l.state != 1 {
-		panic(fmt.Errorf("report: no message waiting to be reported"))
+func (bcm *BroadcastMessage[T]) Report() {
+	if bcm.l == nil || bcm.l.hasReported {
+		return
 	}
+	defer bcm.l.unsubscribe(*bcm)
 
-	l.resp <- struct{}{}
-	l.state = 0
-}
-
-// Waits for the message and tells the Broadcaster to continue instantly
-func (l *BroadcastListener[T]) Get() T {
-	if l.state != 0 {
-		panic(fmt.Errorf("listen: previous message not handled correcly, probably missing report"))
-	}
-
-	defer func() {
-		l.resp <- struct{}{}
-	}()
-
-	return <- l.msg
-}
-
-// Removes the listener from the Broadcaster, making it unusable
-func (l *BroadcastListener[T]) Unsubscribe() {
-	if l.state != 0 {
-		panic(fmt.Errorf("unsubscribe: previous message not handled correcly, cannot leave"))
-	}
-	close(l.msg)
-	close(l.resp)
-
-	delete(l.bc.listeners, l.id)
+	bcm.l.hasReported = true
+	bcm.wg.Done()
 }
